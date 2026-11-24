@@ -76,6 +76,15 @@ static void server_set_shutdown_handler(std::function<void(int)> handler) {
     }
 }
 
+// clears the handler when the server's locals go: declared after those the handler refers to, so it goes first, and
+// a shutdown from another thread never reaches a destroyed server
+struct server_shutdown_handler_guard {
+    ~server_shutdown_handler_guard() {
+        std::lock_guard<std::mutex> lock(embedded_mutex);
+        shutdown_handler = nullptr;
+    }
+};
+
 void llama_server_shutdown(void) {
     embedded_stop.store(true);
     std::lock_guard<std::mutex> lock(embedded_mutex);
@@ -515,6 +524,7 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
 
     // setup server instances manager
     std::optional<server_models_routes> models_routes;
+    server_shutdown_handler_guard handler_guard;
     try {
         models_routes.emplace(params, argc, argv);
     } catch (const std::exception & e) {
@@ -658,6 +668,7 @@ static int server_run_instance(common_params & params, server_role & role, commo
     server_tools   tools;
 
     server_http_context ctx_http;
+    server_shutdown_handler_guard handler_guard;
     if (!ctx_http.init(params)) {
         SRV_ERR("%s", "failed to initialize HTTP server\n");
         return 1;
