@@ -16,6 +16,8 @@
 #include <atomic>
 #include <clocale>
 #include <exception>
+#include <functional>
+#include <mutex>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
 
@@ -50,6 +52,33 @@ int llama_server(int argc, char ** argv);
 int llama_server(common_params & params, int argc, char ** argv);
 void llama_server_terminate();
 void llama_server_terminate() {
+    if (shutdown_handler) {
+        shutdown_handler(0);
+    }
+}
+
+// embedded in an app, as on iOS where no other process may be started: the server runs on a thread of the
+// app's, installs no signal handlers and never exits the process. llama_server_shutdown() may be called from
+// any thread at any time, also while the model loads or before the server got that far; the caller repeats it
+// until llama_server_main() has returned (a stop just before the task loop starts can be missed once).
+extern "C" int  llama_server_main(int argc, char ** argv);
+extern "C" void llama_server_shutdown(void);
+
+static std::mutex       embedded_mutex;
+static std::atomic_bool embedded_stop{false};
+
+// set the handler with the lock held, and run it at once if a stop was asked for meanwhile
+static void server_set_shutdown_handler(std::function<void(int)> handler) {
+    std::lock_guard<std::mutex> lock(embedded_mutex);
+    shutdown_handler = std::move(handler);
+    if (embedded_stop.load() && shutdown_handler) {
+        shutdown_handler(0);
+    }
+}
+
+void llama_server_shutdown(void) {
+    embedded_stop.store(true);
+    std::lock_guard<std::mutex> lock(embedded_mutex);
     if (shutdown_handler) {
         shutdown_handler(0);
     }
@@ -561,14 +590,14 @@ static int server_run_router(common_params & params, int argc, char ** argv, con
     }
     ctx_http.is_ready.store(true);
 
-    shutdown_handler = [&](int) {
+    server_set_shutdown_handler([&](int) {
         if (models_routes.has_value()) {
             // important to disconnect any SSE clients
             models_routes->stopping.store(true);
         }
         mcp_mgr.shutdown();
         ctx_http.stop();
-    };
+    });
 
     try {
         models_routes->models.load_startup_models();
@@ -681,11 +710,11 @@ static int server_run_instance(common_params & params, server_role & role, commo
 
     SRV_INF("%s", "model loaded\n");
 
-    shutdown_handler = [&](int) {
+    server_set_shutdown_handler([&](int) {
         mcp_mgr.shutdown();
         // this will unblock start_loop()
         ctx_server.terminate();
-    };
+    });
 
     if (opts.install_signal_handlers) {
         server_install_signal_handlers();
@@ -712,7 +741,9 @@ static int server_run_instance(common_params & params, server_role & role, commo
     }
 
     // this call blocks the main thread until queue_tasks.terminate() is called
-    ctx_server.start_loop();
+    if (!embedded_stop.load()) {
+        ctx_server.start_loop();
+    }
 
     clean_up();
     ctx_http.join();
@@ -810,4 +841,47 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     server_role role;
     return server_run(params, argc, argv, role, opts);
+}
+
+int llama_server_main(int argc, char ** argv) {
+    embedded_stop.store(false);
+
+    std::setlocale(LC_NUMERIC, "C");
+#ifndef _WIN32
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
+    common_params params;
+    common_init();
+    server_stream_session_manager_start();
+
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
+        server_stream_session_manager_stop();
+        return 1;
+    }
+
+    // a stop asked for while the model loads cancels the load
+    if (params.load_progress_callback == nullptr) {
+        params.load_progress_callback = [](float, void *) { return !embedded_stop.load(); };
+    }
+
+    SRV_INF("%s", "initializing (embedded) ...\n");
+
+    llama_backend_init();
+    llama_numa_init(params.numa);
+
+    server_run_opts opts;
+    opts.install_signal_handlers = false;
+
+    server_role role;
+    const int result = server_run(params, argc, argv, role, opts);
+    {
+        // the handler holds references into the frames that just returned
+        std::lock_guard<std::mutex> lock(embedded_mutex);
+        shutdown_handler = nullptr;
+    }
+    // a failure before the server got going leaves this running
+    server_stream_session_manager_stop();
+    common_log_flush(common_log_main());
+    return result;
 }
