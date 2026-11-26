@@ -1317,6 +1317,9 @@ private:
             return false;
         }
 
+        // a decode under way when the server is told to stop gives up, rather than finishing a long prompt first
+        llama_set_abort_callback(ctx_tgt, [](void * queue) { return static_cast<server_queue *>(queue)->is_terminated(); }, &queue_tasks);
+
         vocab = llama_model_get_vocab(model_tgt);
 
         try {
@@ -4715,7 +4718,10 @@ private:
                     err = "Compute error.";
                 }
 
-                // TODO: handle ret == 2 (abort) when we start aborting
+                // aborted: the server is stopping (see the abort callback set in load_model)
+                if (ret == 2) {
+                    err = "Decoding was aborted, the server is shutting down.";
+                }
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);

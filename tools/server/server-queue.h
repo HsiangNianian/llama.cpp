@@ -2,6 +2,7 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -16,6 +17,8 @@ struct server_queue {
 private:
     int id = 0;
     bool running  = false;
+    // set once terminate() is called, and never cleared: what still waits on this queue gives up
+    std::atomic<bool> terminated{false};
     bool sleeping = false;
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
@@ -75,7 +78,13 @@ public:
     }
 
     // end the start_loop routine
+    // also ends the wait of every response reader on this queue (server_response_reader::next), and aborts a
+    // decode under way, so a server stopped while it answers stops in moments rather than when its clients give up
     void terminate();
+
+    bool is_terminated() const {
+        return terminated.load();
+    }
 
     /**
      * Main loop consists of these steps:

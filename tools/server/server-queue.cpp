@@ -130,6 +130,7 @@ void server_queue::wait_until_no_sleep() {
 }
 
 void server_queue::terminate() {
+    terminated.store(true);
     std::unique_lock<std::mutex> lock(mutex_tasks);
     running = false;
     condition_tasks.notify_all();
@@ -552,6 +553,17 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
     while (true) {
         server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
         if (result == nullptr) {
+            // the task loop has ended: no result will come, so the request ends with an error rather than waiting
+            // for its client to give up, which would hold up the server's shutdown until then
+            if (queue_tasks.is_terminated()) {
+                auto err = std::make_unique<server_task_result_error>();
+                err->id       = id_tasks.empty() ? -1 : *id_tasks.begin();
+                err->index    = 0;
+                err->err_type = ERROR_TYPE_UNAVAILABLE;
+                err->err_msg  = "the server is shutting down";
+                stop();
+                return err;
+            }
             // timeout, check stop condition
             if (should_stop()) {
                 return nullptr;
